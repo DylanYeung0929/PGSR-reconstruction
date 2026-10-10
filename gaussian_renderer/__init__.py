@@ -33,7 +33,8 @@ def render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
     return normal_ref
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, 
-           app_model: AppModel=None, return_plane = True, return_depth_normal = True):
+           app_model: AppModel=None, return_plane = True, return_depth_normal = True,
+           z_depth_only = False):
     """
     Render the scene. 
     
@@ -133,6 +134,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     pts_in_cam = means3D @ viewpoint_camera.world_view_transform[:3,:3] + viewpoint_camera.world_view_transform[3,:3]
     depth_z = pts_in_cam[:, 2]
     local_distance = (local_normal * pts_in_cam).sum(-1).abs()
+    if z_depth_only:
+        # Composite camera-space Z directly. With normal (0,0,-1), the
+        # rasterizer's plane-depth equation reduces to weighted Z / alpha.
+        local_normal = torch.zeros_like(local_normal)
+        local_normal[:, 2] = -1.0
+        local_distance = depth_z
     input_all_map = torch.zeros((means3D.shape[0], 5)).cuda().float()
     input_all_map[:, :3] = local_normal
     input_all_map[:, 3] = 1.0
@@ -161,6 +168,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "radii": radii,
                     "out_observe": out_observe,
                     "rendered_normal": rendered_normal,
+                    "rendered_alpha": rendered_alpha,
                     "plane_depth": plane_depth,
                     "rendered_distance": rendered_distance
                     }

@@ -159,20 +159,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
+        need_plane = iteration > opt.single_view_weight_from_iter or (
+            opt.silhouette_weight > 0 and viewpoint_cam.mask is not None
+        )
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, app_model=app_model,
-                            return_plane=iteration>opt.single_view_weight_from_iter, return_depth_normal=iteration>opt.single_view_weight_from_iter)
+                            return_plane=need_plane, return_depth_normal=iteration>opt.single_view_weight_from_iter)
         image, viewspace_point_tensor, visibility_filter, radii = \
             render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
         # Loss
         ssim_loss = (1.0 - ssim(image, gt_image))
         if 'app_image' in render_pkg and ssim_loss < 0.5:
-            app_image = render_pkg['app_image']
-            Ll1 = l1_loss(app_image, gt_image)
+            loss_image = render_pkg['app_image']
         else:
-            Ll1 = l1_loss(image, gt_image)
+            loss_image = image
+        if opt.foreground_weight > 0 and viewpoint_cam.mask is not None:
+            foreground_mask = viewpoint_cam.mask > 0.5
+            background_mask = ~foreground_mask
+            pixel_l1 = (loss_image - gt_image).abs().mean(dim=0, keepdim=True)
+            foreground_l1 = pixel_l1[foreground_mask].mean()
+            background_l1 = pixel_l1[background_mask].mean()
+            Ll1 = (
+                opt.foreground_weight * foreground_l1
+                + (1.0 - opt.foreground_weight) * background_l1
+            )
+        else:
+            Ll1 = l1_loss(loss_image, gt_image)
         image_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
         loss = image_loss.clone()
+        if opt.silhouette_weight > 0 and viewpoint_cam.mask is not None:
+            target_alpha = viewpoint_cam.mask.to(render_pkg["rendered_alpha"].device).float()
+            predicted_alpha = render_pkg["rendered_alpha"].clamp(1.0e-5, 1.0 - 1.0e-5)
+            silhouette_loss = torch.nn.functional.binary_cross_entropy(predicted_alpha, target_alpha)
+            loss += opt.silhouette_weight * silhouette_loss
         
         # scale loss
         if visibility_filter.sum() > 0:
@@ -239,6 +258,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     d_mask = d_mask
                     weights = torch.ones_like(pixel_noise)
+                    weights[~d_mask] = 0
+                # Alpha-backed synthetic captures provide exact silhouettes.
+                # Background plane depths are undefined and must not participate
+                # in PGSR's geometry/NCC consistency terms, or they can create
+                # repeated camera-facing shells on thin, textureless objects.
+                if viewpoint_cam.mask is not None:
+                    reference_foreground = viewpoint_cam.mask.to(d_mask.device).squeeze() > 0.5
+                    d_mask = d_mask & reference_foreground.reshape(-1)
                     weights[~d_mask] = 0
                 if iteration % 200 == 0:
                     gt_img_show = ((gt_image).permute(1,2,0).clamp(0,1)[:,:,[2,1,0]]*255).detach().cpu().numpy().astype(np.uint8)
